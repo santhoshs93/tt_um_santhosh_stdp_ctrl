@@ -438,3 +438,209 @@ async def test_simultaneous_spikes(dut):
     dut._log.info(f"Simultaneous spikes: update_ready={update_ready}")
     # deltaT should be 0 → within window → should still produce an update
     assert update_ready == 1, "Simultaneous spikes should still trigger STDP computation"
+
+
+# ============================================================
+# SPI and FSM corner-case stress tests
+# ============================================================
+
+async def spi_write_fast(dut, addr, data):
+    """SPI write with minimum timing (2-cycle SCK half-periods)."""
+    cs_bit = 0
+    mosi_bit = 1
+    sck_bit = 3
+    word = ((addr & 0x7F) << 8) | (data & 0xFF)
+
+    dut.uio_in.value = 0  # CS=0
+    await ClockCycles(dut.clk, 2)
+
+    for i in range(16):
+        bit_val = (word >> (15 - i)) & 1
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 2)
+        dut.uio_in.value = (bit_val << mosi_bit) | (1 << sck_bit)
+        await ClockCycles(dut.clk, 2)
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 1)
+
+    dut.uio_in.value = (1 << cs_bit)
+    await ClockCycles(dut.clk, 2)
+
+
+async def spi_read_fast(dut, addr):
+    """SPI read with minimum timing (2-cycle SCK half-periods)."""
+    cs_bit = 0
+    mosi_bit = 1
+    sck_bit = 3
+    word = (1 << 15) | ((addr & 0x7F) << 8)
+
+    dut.uio_in.value = 0
+    await ClockCycles(dut.clk, 2)
+
+    read_data = 0
+    for i in range(16):
+        bit_val = (word >> (15 - i)) & 1
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 2)
+        dut.uio_in.value = (bit_val << mosi_bit) | (1 << sck_bit)
+        await ClockCycles(dut.clk, 1)
+        if i >= 8:
+            miso = (int(dut.uio_out.value) >> 2) & 1
+            read_data = (read_data << 1) | miso
+        await ClockCycles(dut.clk, 1)
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 1)
+
+    dut.uio_in.value = (1 << cs_bit)
+    await ClockCycles(dut.clk, 2)
+    return read_data
+
+
+@cocotb.test()
+async def test_spi_fast_timing(dut):
+    """SPI at maximum speed (2-cycle SCK): write/read config and LUT registers."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    test_data = {0x01: 0x07, 0x02: 0x0C,
+                 0x08: 0xAA, 0x09: 0x55, 0x0A: 0x33, 0x0B: 0xCC,
+                 0x0C: 0x11, 0x0D: 0x22, 0x0E: 0x44, 0x0F: 0x88}
+
+    for addr, val in test_data.items():
+        await spi_write_fast(dut, addr, val)
+
+    for addr, val in test_data.items():
+        rb = await spi_read_fast(dut, addr)
+        assert rb == val, f"Fast SPI reg 0x{addr:02x}: expected 0x{val:02x}, got 0x{rb:02x}"
+
+    dut._log.info("All fast-SPI register writes verified")
+
+
+@cocotb.test()
+async def test_spi_back_to_back(dut):
+    """Back-to-back SPI writes with minimal CS inter-frame gap."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Write all 8 LUT entries back-to-back at fast speed
+    lut_vals = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]
+    for i, v in enumerate(lut_vals):
+        await spi_write_fast(dut, 0x08 + i, v)
+
+    # Read back at normal speed to verify
+    for i, v in enumerate(lut_vals):
+        rb = await spi_read(dut, 0x08 + i)
+        assert rb == v, f"Back-to-back LUT[{i}]: expected 0x{v:02x}, got 0x{rb:02x}"
+
+    dut._log.info("Back-to-back SPI LUT writes verified")
+
+
+@cocotb.test()
+async def test_rapid_spike_pairs(dut):
+    """Fire 3 consecutive LTP computations without reset between them."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    await spi_write(dut, 0x00, 0x01)  # enable continuous
+    await spi_write(dut, 0x01, 0x04)  # learn_rate=4
+    await spi_write(dut, 0x02, 0x0F)  # time_window=15
+
+    for iteration in range(3):
+        await pulse_ts_clk(dut, 3)
+
+        # Pre spike
+        dut.ui_in.value = 0b01001
+        await ClockCycles(dut.clk, 4)
+        dut.ui_in.value = 0b01000
+        await ClockCycles(dut.clk, 4)
+
+        await pulse_ts_clk(dut, 2)
+
+        # Post spike
+        dut.ui_in.value = 0b01010
+        await ClockCycles(dut.clk, 4)
+        dut.ui_in.value = 0b01000
+
+        # Wait for update_ready
+        update_ready = 0
+        for _ in range(60):
+            await ClockCycles(dut.clk, 1)
+            uo = int(dut.uo_out.value)
+            if uo & 1:
+                update_ready = 1
+                break
+
+        assert update_ready == 1, f"Iteration {iteration}: update_ready not asserted"
+        ltp = (uo >> 1) & 1
+        assert ltp == 1, f"Iteration {iteration}: expected LTP"
+        dut._log.info(f"Rapid pair {iteration}: LTP ok, delta={uo >> 4}")
+
+        # Wait for FSM to return to IDLE before next pair
+        await ClockCycles(dut.clk, 10)
+
+
+@cocotb.test()
+async def test_learn_en_gate(dut):
+    """Verify no STDP computation when learn_en=0."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    await spi_write(dut, 0x00, 0x01)  # enable
+    await spi_write(dut, 0x01, 0x04)
+    await spi_write(dut, 0x02, 0x0F)
+
+    await pulse_ts_clk(dut, 3)
+
+    # Pre spike WITHOUT learn_en
+    dut.ui_in.value = 0b00001  # pre_spike=1, learn_en=0
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = 0b00000
+    await ClockCycles(dut.clk, 4)
+
+    await pulse_ts_clk(dut, 2)
+
+    # Post spike WITHOUT learn_en
+    dut.ui_in.value = 0b00010  # post_spike=1, learn_en=0
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = 0b00000
+
+    # Wait — update_ready should NOT fire
+    update_ready = 0
+    for _ in range(40):
+        await ClockCycles(dut.clk, 1)
+        if int(dut.uo_out.value) & 1:
+            update_ready = 1
+            break
+
+    assert update_ready == 0, "STDP should NOT compute when learn_en=0"
+    dut._log.info("learn_en gate verified: no spurious computation")
+
+
+@cocotb.test()
+async def test_register_boundary_values(dut):
+    """Write 0x00 and 0xFF to all writable registers, verify readback."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    writable = [0x01, 0x02] + list(range(0x08, 0x10))  # learn_rate, window, 8 LUT
+
+    # Test 0x00
+    for addr in writable:
+        await spi_write(dut, addr, 0x00)
+    for addr in writable:
+        rb = await spi_read(dut, addr)
+        assert rb == 0x00, f"Reg 0x{addr:02x} with 0x00: got 0x{rb:02x}"
+
+    # Test 0xFF
+    for addr in writable:
+        await spi_write(dut, addr, 0xFF)
+    for addr in writable:
+        rb = await spi_read(dut, addr)
+        assert rb == 0xFF, f"Reg 0x{addr:02x} with 0xFF: got 0x{rb:02x}"
+
+    dut._log.info("All register boundary values verified")

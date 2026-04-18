@@ -175,6 +175,10 @@ module tt_um_santhosh_stdp_ctrl (
         end else if (reg_ctrl[1]) begin
             pre_valid  <= 1'b0;
             post_valid <= 1'b0;
+        end else if (clear_valid) begin
+            // STDP FSM consumed the spike pair — clear flags (single always block owns pre/post_valid)
+            pre_valid  <= 1'b0;
+            post_valid <= 1'b0;
         end else begin
             if (pre_edge) begin
                 pre_timestamp <= ts_counter;
@@ -208,6 +212,7 @@ module tt_um_santhosh_stdp_ctrl (
     reg        potentiation;
     reg        depression;
     reg        wt_overflow;
+    reg        clear_valid;   // Pulse to consume spike pair (clears pre/post_valid)
 
     wire [3:0] learn_rate = reg_learn_rate[3:0];
     wire [3:0] time_window = reg_time_window[3:0];
@@ -227,15 +232,18 @@ module tt_um_santhosh_stdp_ctrl (
             potentiation  <= 1'b0;
             depression    <= 1'b0;
             wt_overflow   <= 1'b0;
+            clear_valid   <= 1'b0;
         end else if (reg_ctrl[1]) begin
             stdp_state   <= STDP_IDLE;
             update_ready <= 1'b0;
             potentiation <= 1'b0;
             depression   <= 1'b0;
+            clear_valid  <= 1'b0;
         end else begin
             case (stdp_state)
                 STDP_IDLE: begin
                     update_ready <= 1'b0;
+                    clear_valid  <= 1'b0;
                     if (stdp_en) begin
                         delta_t    <= post_timestamp - pre_timestamp;
                         stdp_state <= STDP_COMPUTE;
@@ -243,6 +251,8 @@ module tt_um_santhosh_stdp_ctrl (
                 end
 
                 STDP_COMPUTE: begin
+                    // Signal timestamp block to consume spike pair
+                    clear_valid <= 1'b1;
                     // Determine sign and magnitude
                     if (delta_t[7]) begin
                         // Negative: post before pre -> LTD
@@ -257,6 +267,7 @@ module tt_um_santhosh_stdp_ctrl (
                 end
 
                 STDP_UPDATE: begin
+                    clear_valid <= 1'b0;
                     // Check if within learning window
                     if (abs_delta <= {4'b0, time_window}) begin
                         // LUT lookup: LTP uses entries 0-3, LTD uses 4-7
@@ -264,18 +275,16 @@ module tt_um_santhosh_stdp_ctrl (
                             lut_value <= lut_mem[abs_delta[1:0]];
                             potentiation <= 1'b1;
                             depression   <= 1'b0;
-                            // Overflow: check LUT memory directly (NBA pipeline)
                             wt_overflow <= (lut_mem[abs_delta[1:0]] == 8'hFF);
+                            // Read LUT directly (not through lut_value NBA) for correct pipeline
+                            weight_update <= lut_mem[abs_delta[1:0]] >> (4'd3 - learn_rate[1:0]);
                         end else begin
                             lut_value <= lut_mem[abs_delta[1:0] + 3'd4];
                             potentiation <= 1'b0;
                             depression   <= 1'b1;
                             wt_overflow <= (lut_mem[abs_delta[1:0] + 3'd4] == 8'hFF);
+                            weight_update <= lut_mem[abs_delta[1:0] + 3'd4] >> (4'd3 - learn_rate[1:0]);
                         end
-
-                        // Scale by learning rate: right-shift by (3 - learn_rate[1:0])
-                        // learn_rate[1:0]=0 -> /8, =1 -> /4, =2 -> /2, =3 -> full
-                        weight_update <= lut_value >> (4'd3 - learn_rate[1:0]);
                     end else begin
                         // Outside window: no update
                         weight_update <= 8'd0;
