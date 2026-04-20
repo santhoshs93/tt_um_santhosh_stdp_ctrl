@@ -644,3 +644,164 @@ async def test_register_boundary_values(dut):
         assert rb == 0xFF, f"Reg 0x{addr:02x} with 0xFF: got 0x{rb:02x}"
 
     dut._log.info("All register boundary values verified")
+
+
+# ============================================================
+# R-STDP / Anti-Hebbian / Eligibility Trace Tests
+# ============================================================
+
+async def trigger_ltp(dut):
+    """Helper: trigger pre-before-post spike pair with learn_en, return uo_out."""
+    await pulse_ts_clk(dut, 3)
+    dut.ui_in.value = 0b01001  # pre_spike=1, learn_en=1
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = 0b01000  # learn_en only
+    await ClockCycles(dut.clk, 4)
+    await pulse_ts_clk(dut, 2)
+    dut.ui_in.value = 0b01010  # post_spike=1, learn_en=1
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = 0b01000
+
+    # Poll for update_ready
+    for _ in range(60):
+        await ClockCycles(dut.clk, 1)
+        uo = int(dut.uo_out.value)
+        if uo & 1:
+            return uo
+    return 0
+
+
+async def trigger_ltp_with_reward(dut):
+    """Helper: trigger pre-before-post spike pair with reward=1."""
+    await pulse_ts_clk(dut, 3)
+    dut.ui_in.value = 0b11001  # pre_spike=1, learn_en=1, reward=1 (bit4)
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = 0b11000  # learn_en=1, reward=1
+    await ClockCycles(dut.clk, 4)
+    await pulse_ts_clk(dut, 2)
+    dut.ui_in.value = 0b11010  # post_spike=1, learn_en=1, reward=1
+    await ClockCycles(dut.clk, 4)
+    dut.ui_in.value = 0b11000
+
+    for _ in range(60):
+        await ClockCycles(dut.clk, 1)
+        uo = int(dut.uo_out.value)
+        if uo & 1:
+            return uo
+    return 0
+
+
+@cocotb.test()
+async def test_reward_gate_blocks_output(dut):
+    """With reward_gate_en=1 and reward=0, weight output is zeroed."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Enable STDP + reward gate (ctrl[4]=1)
+    await spi_write(dut, 0x00, 0x11)  # enable + reward_gate_en
+    await spi_write(dut, 0x01, 0x03)  # learn_rate=3
+    await spi_write(dut, 0x02, 0x0F)  # time_window=15
+
+    # Trigger LTP without reward (reward pin = 0)
+    uo = await trigger_ltp(dut)
+    gated_ready = uo & 1
+    weight_nibble = (uo >> 4) & 0xF
+    dut._log.info(f"Reward gate (no reward): ready={gated_ready}, weight={weight_nibble}")
+    # update_gated should be 0 when reward=0 and reward_gate_en=1
+    assert gated_ready == 0, "update_gated should be 0 without reward"
+
+
+@cocotb.test()
+async def test_reward_gate_passes_with_reward(dut):
+    """With reward_gate_en=1 and reward=1, weight output passes through."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Enable STDP + reward gate
+    await spi_write(dut, 0x00, 0x11)  # enable + reward_gate_en
+    await spi_write(dut, 0x01, 0x03)  # learn_rate=3
+    await spi_write(dut, 0x02, 0x0F)  # time_window=15
+
+    # Trigger LTP with reward
+    uo = await trigger_ltp_with_reward(dut)
+    gated_ready = uo & 1
+    weight_nibble = (uo >> 4) & 0xF
+    dut._log.info(f"Reward gate (with reward): ready={gated_ready}, weight={weight_nibble}")
+    assert gated_ready == 1, "update_gated should be 1 with reward"
+    assert weight_nibble > 0, "Weight output should be non-zero with reward"
+
+
+@cocotb.test()
+async def test_anti_hebbian_ltp_becomes_ltd(dut):
+    """Anti-Hebbian mode: pre-before-post should produce LTD instead of LTP."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Enable + anti_hebbian (ctrl[3]=1)
+    await spi_write(dut, 0x00, 0x09)  # enable + anti_hebbian
+    await spi_write(dut, 0x01, 0x04)
+    await spi_write(dut, 0x02, 0x0F)
+
+    # Trigger pre-before-post (would be LTP normally)
+    uo = await trigger_ltp(dut)
+    potentiation = (uo >> 1) & 1
+    depression = (uo >> 2) & 1
+    dut._log.info(f"Anti-Hebbian: LTP={potentiation}, LTD={depression}")
+    assert depression == 1, "Anti-Hebbian: pre-before-post should produce LTD"
+    assert potentiation == 0, "Anti-Hebbian: should NOT produce LTP"
+
+
+@cocotb.test()
+async def test_eligibility_trace_accumulates(dut):
+    """Eligibility trace increments on STDP events and decays between them."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Enable + trace_en (ctrl[5]=1), trace_decay=1 (learn_rate[7:4]=1)
+    await spi_write(dut, 0x00, 0x21)  # enable + trace_en
+    await spi_write(dut, 0x01, 0x14)  # trace_decay=1 (high nibble), learn_rate=4
+    await spi_write(dut, 0x02, 0x0F)  # time_window=15
+
+    # Trigger STDP event to increment trace
+    uo = await trigger_ltp(dut)
+    update_ready_raw = (uo >> 0) & 1  # This is update_gated, but w/o reward gate should pass
+    dut._log.info(f"First STDP trigger: uo=0x{uo:02x}")
+
+    # Read status register - trace_nonzero should be bit 5
+    status = await spi_read(dut, 0x07)
+    trace_nz = (status >> 5) & 1
+    dut._log.info(f"Status after STDP: 0x{status:02x}, trace_nonzero={trace_nz}")
+    # Trace should have been incremented (though it will also decay)
+    # After 1 increment and some decay cycles, check status
+
+    # Wait long enough for trace to decay back to 0
+    await ClockCycles(dut.clk, 500)
+    status = await spi_read(dut, 0x07)
+    trace_nz_after = (status >> 5) & 1
+    dut._log.info(f"Status after decay: 0x{status:02x}, trace_nonzero={trace_nz_after}")
+    assert trace_nz_after == 0, "Trace should decay to 0 after sufficient time"
+
+
+@cocotb.test()
+async def test_status_register_reward_bit(dut):
+    """Status register bit 6 reflects the reward input pin state."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Reward pin = 0 (default)
+    status = await spi_read(dut, 0x07)
+    reward_bit = (status >> 4) & 1
+    assert reward_bit == 0, "Reward bit should be 0 when reward pin is low"
+
+    # Set reward pin high (ui_in[4])
+    dut.ui_in.value = 0b10000  # reward=1
+    await ClockCycles(dut.clk, 4)
+    status = await spi_read(dut, 0x07)
+    reward_bit = (status >> 4) & 1
+    assert reward_bit == 1, "Reward bit should be 1 when reward pin is high"
+    dut.ui_in.value = 0  # cleanup

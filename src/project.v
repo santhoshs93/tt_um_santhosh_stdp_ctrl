@@ -7,6 +7,9 @@
  * - Computes deltaT and applies programmable STDP curve via LUT
  * - Outputs signed weight update (potentiation/depression)
  * - SPI-configurable learning rate, time window, and STDP curve shape
+ * - R-STDP reward gate: weight updates gated by external reward signal
+ * - Anti-Hebbian mode: inverts LTP/LTD polarity for inhibitory learning
+ * - Eligibility trace: leaky counter for delayed reward credit assignment
  * - Standalone IP for any synapse technology (memristor, skyrmion, etc.)
  */
 
@@ -30,6 +33,7 @@ module tt_um_santhosh_stdp_ctrl (
     wire post_spike  = ui_in[1];   // Post-synaptic spike input
     wire ts_clk      = ui_in[2];   // Timestamp clock (can differ from system clock)
     wire learn_en    = ui_in[3];   // Learning enable
+    wire reward      = ui_in[4];   // R-STDP reward signal
 
     // SPI signals
     wire spi_cs_n = uio_in[0];
@@ -59,8 +63,9 @@ module tt_um_santhosh_stdp_ctrl (
     );
 
     // Configuration registers
-    reg [7:0] reg_ctrl;        // 0x00: [0]=enable, [1]=reset, [2]=single_shot
-    reg [7:0] reg_learn_rate;  // 0x01: [3:0]=learning rate (0-15)
+    reg [7:0] reg_ctrl;        // 0x00: [0]=enable, [1]=reset, [2]=single_shot,
+                               //       [3]=anti_hebbian, [4]=reward_gate_en, [5]=trace_en
+    reg [7:0] reg_learn_rate;  // 0x01: [3:0]=learning rate, [7:4]=trace decay rate
     reg [7:0] reg_time_window; // 0x02: [3:0]=STDP time window width
     wire [7:0] reg_pre_ts;     // 0x03: last pre timestamp (read-only)
     wire [7:0] reg_post_ts;    // 0x04: last post timestamp (read-only)
@@ -216,6 +221,10 @@ module tt_um_santhosh_stdp_ctrl (
 
     wire [3:0] learn_rate = reg_learn_rate[3:0];
     wire [3:0] time_window = reg_time_window[3:0];
+    wire [3:0] trace_decay = reg_learn_rate[7:4];
+    wire       anti_hebbian   = reg_ctrl[3];
+    wire       reward_gate_en = reg_ctrl[4];
+    wire       trace_en       = reg_ctrl[5];
 
     wire both_valid = pre_valid & post_valid;
     wire stdp_en = learn_en & reg_ctrl[0] & both_valid;
@@ -254,13 +263,14 @@ module tt_um_santhosh_stdp_ctrl (
                     // Signal timestamp block to consume spike pair
                     clear_valid <= 1'b1;
                     // Determine sign and magnitude
+                    // Anti-Hebbian mode inverts LTP/LTD polarity
                     if (delta_t[7]) begin
-                        // Negative: post before pre -> LTD
-                        is_ltp    <= 1'b0;
+                        // Negative: post before pre -> LTD normally, LTP in anti-Hebbian
+                        is_ltp    <= anti_hebbian;
                         abs_delta <= (~delta_t) + 8'd1; // twos complement
                     end else begin
-                        // Positive: pre before post -> LTP
-                        is_ltp    <= 1'b1;
+                        // Positive: pre before post -> LTP normally, LTD in anti-Hebbian
+                        is_ltp    <= ~anti_hebbian;
                         abs_delta <= delta_t;
                     end
                     stdp_state <= STDP_UPDATE;
@@ -314,16 +324,48 @@ module tt_um_santhosh_stdp_ctrl (
 
     assign reg_delta_t    = delta_t;
     assign reg_weight_upd = weight_update;
-    assign reg_status     = {4'b0, wt_overflow, depression, potentiation, update_ready};
+    assign reg_status     = {2'b0, trace_nonzero, reward, wt_overflow, depression, potentiation, update_ready};
+
+    // ============================================================
+    // Eligibility Trace: leaky counter for delayed reward
+    // ============================================================
+    reg [7:0] elig_trace;
+    wire      trace_nonzero = (elig_trace != 8'd0);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            elig_trace <= 8'd0;
+        end else if (reg_ctrl[1]) begin
+            elig_trace <= 8'd0;
+        end else if (trace_en) begin
+            if (update_ready) begin
+                // Increment trace on STDP event (saturate at 255)
+                if (elig_trace < 8'hFF)
+                    elig_trace <= elig_trace + 8'd1;
+            end else begin
+                // Decay trace when no STDP event this cycle
+                if (elig_trace > {4'b0, trace_decay})
+                    elig_trace <= elig_trace - {4'b0, trace_decay};
+                else
+                    elig_trace <= 8'd0;
+            end
+        end
+    end
+
+    // Reward gating logic
+    wire reward_ok = ~reward_gate_en | reward;
+    // When trace_en: also require trace_nonzero for gated output
+    wire update_gated = update_ready & (reward_ok | ~reward_gate_en) &
+                        (~trace_en | trace_nonzero | ~reward_gate_en);
 
     // ============================================================
     // Output assignments
     // ============================================================
-    assign uo_out[0]   = update_ready;              // Weight update ready
-    assign uo_out[1]   = potentiation;              // LTP
-    assign uo_out[2]   = depression;                // LTD
-    assign uo_out[3]   = wt_overflow;               // Weight overflow
-    assign uo_out[7:4] = weight_update[3:0];        // Weight delta magnitude [3:0]
+    assign uo_out[0]   = update_gated;                 // Weight update ready (reward-gated)
+    assign uo_out[1]   = potentiation;                 // LTP
+    assign uo_out[2]   = depression;                   // LTD
+    assign uo_out[3]   = wt_overflow;                  // Weight overflow
+    assign uo_out[7:4] = reward_ok ? weight_update[3:0] : 4'b0000; // Gated weight delta
 
     assign uio_out[0]  = 1'b0;                     // CS is input
     assign uio_out[1]  = 1'b0;                     // MOSI is input
@@ -338,6 +380,6 @@ module tt_um_santhosh_stdp_ctrl (
     // uio[7:4]=debug(1), uio[3]=SCK in(0), uio[2]=MISO(dynamic), uio[1]=MOSI in(0), uio[0]=CS in(0)
 
     // Unused inputs
-    wire _unused = &{ena, ui_in[7:4], uio_in[2], uio_in[7:4], 1'b0};
+    wire _unused = &{ena, ui_in[7:5], uio_in[2], uio_in[7:4], 1'b0};
 
 endmodule
